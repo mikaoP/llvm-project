@@ -14,3 +14,250 @@ define i32 @test(i64 %i) {
   %b = sext i16 %a to i32
   ret i32 %b
 }
+
+declare void @use32(i32)
+
+; The trunc has another use, so widening the expression removes no cast and
+; the sext has to be re-created as shl + ashr.
+define i64 @sext_of_multiuse_trunc(i64 %x) {
+; CHECK-LABEL: define i64 @sext_of_multiuse_trunc(
+; CHECK-SAME: i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[X]], 32
+; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    ret i64 [[E]]
+;
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  %e = sext i32 %t to i64
+  ret i64 %e
+}
+
+; Widening would also drop the nsw and hide the offset from the gep fold.
+define ptr @sext_of_add_of_multiuse_trunc(ptr %p, i64 %x) {
+; CHECK-LABEL: define ptr @sext_of_add_of_multiuse_trunc(
+; CHECK-SAME: ptr [[P:%.*]], i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    [[A:%.*]] = shl i64 [[X]], 32
+; CHECK-NEXT:    [[SEXT:%.*]] = add i64 [[A]], 4294967296
+; CHECK-NEXT:    [[TMP1:%.*]] = ashr exact i64 [[SEXT]], 30
+; CHECK-NEXT:    [[G:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 [[TMP1]]
+; CHECK-NEXT:    ret ptr [[G]]
+;
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  %a = add nsw i32 %t, 1
+  %e = sext i32 %a to i64
+  %g = getelementptr inbounds float, ptr %p, i64 %e
+  ret ptr %g
+}
+
+define i64 @sext_of_add_of_multiuse_trunc_no_nsw(i64 %x) {
+; CHECK-LABEL: define i64 @sext_of_add_of_multiuse_trunc_no_nsw(
+; CHECK-SAME: i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    [[A:%.*]] = shl i64 [[X]], 32
+; CHECK-NEXT:    [[SEXT:%.*]] = add i64 [[A]], 4294967296
+; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    ret i64 [[E]]
+;
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  %a = add i32 %t, 1
+  %e = sext i32 %a to i64
+  ret i64 %e
+}
+
+define i64 @sext_of_add_of_multiuse_trunc_variable_offset(i64 %x, i32 %k) {
+; CHECK-LABEL: define i64 @sext_of_add_of_multiuse_trunc_variable_offset(
+; CHECK-SAME: i64 [[X:%.*]], i32 [[K:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    [[A:%.*]] = add nsw i32 [[K]], [[T]]
+; CHECK-NEXT:    [[E:%.*]] = sext i32 [[A]] to i64
+; CHECK-NEXT:    ret i64 [[E]]
+;
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  %a = add nsw i32 %t, %k
+  %e = sext i32 %a to i64
+  ret i64 %e
+}
+
+; Two taps off the same index give the trunc two uses.
+define float @two_taps(ptr %p, i64 %x) {
+; CHECK-LABEL: define float @two_taps(
+; CHECK-SAME: ptr [[P:%.*]], i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[X]], 32
+; CHECK-NEXT:    [[TMP1:%.*]] = ashr exact i64 [[SEXT]], 30
+; CHECK-NEXT:    [[G0:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 [[TMP1]]
+; CHECK-NEXT:    [[V0:%.*]] = load float, ptr [[G0]], align 4
+; CHECK-NEXT:    [[A:%.*]] = shl i64 [[X]], 32
+; CHECK-NEXT:    [[SEXT1:%.*]] = add i64 [[A]], 4294967296
+; CHECK-NEXT:    [[TMP2:%.*]] = ashr exact i64 [[SEXT1]], 30
+; CHECK-NEXT:    [[G1:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 [[TMP2]]
+; CHECK-NEXT:    [[V1:%.*]] = load float, ptr [[G1]], align 4
+; CHECK-NEXT:    [[S:%.*]] = fadd float [[V0]], [[V1]]
+; CHECK-NEXT:    ret float [[S]]
+;
+  %t = trunc i64 %x to i32
+  %e0 = sext i32 %t to i64
+  %g0 = getelementptr inbounds float, ptr %p, i64 %e0
+  %v0 = load float, ptr %g0
+  %a = add nsw i32 %t, 1
+  %e1 = sext i32 %a to i64
+  %g1 = getelementptr inbounds float, ptr %p, i64 %e1
+  %v1 = load float, ptr %g1
+  %s = fadd float %v0, %v1
+  ret float %s
+}
+
+; All uses of the trunc are rewritten, so the trunc is removed.
+define i64 @sext_of_multiuse_trunc_all_uses_rewritten(i64 %x) {
+; CHECK-LABEL: define i64 @sext_of_multiuse_trunc_all_uses_rewritten(
+; CHECK-SAME: i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[A:%.*]] = mul i64 [[X]], [[X]]
+; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[A]], 32
+; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    ret i64 [[E]]
+;
+  %t = trunc i64 %x to i32
+  %a = mul i32 %t, %t
+  %e = sext i32 %a to i64
+  ret i64 %e
+}
+
+define i64 @sext_of_add_of_oneuse_trunc(i64 %x) {
+; CHECK-LABEL: define i64 @sext_of_add_of_oneuse_trunc(
+; CHECK-SAME: i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[A:%.*]] = shl i64 [[X]], 32
+; CHECK-NEXT:    [[SEXT:%.*]] = add i64 [[A]], 4294967296
+; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    ret i64 [[E]]
+;
+  %t = trunc i64 %x to i32
+  %a = add nsw i32 %t, 1
+  %e = sext i32 %a to i64
+  ret i64 %e
+}
+
+define i64 @two_truncs_removed(i64 %x, i64 %y) {
+; CHECK-LABEL: define i64 @two_truncs_removed(
+; CHECK-SAME: i64 [[X:%.*]], i64 [[Y:%.*]]) {
+; CHECK-NEXT:    [[S:%.*]] = add i64 [[X]], [[Y]]
+; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[S]], 32
+; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    ret i64 [[E]]
+;
+  %a = trunc i64 %x to i32
+  %b = trunc i64 %y to i32
+  %s = add i32 %a, %b
+  %e = sext i32 %s to i64
+  ret i64 %e
+}
+
+; No cast is removed, but the widened expression is sign extended already.
+define i64 @sext_is_eliminated(i16 %s) {
+; CHECK-LABEL: define i64 @sext_is_eliminated(
+; CHECK-SAME: i16 [[S:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = sext i16 [[S]] to i64
+; CHECK-NEXT:    [[A:%.*]] = add nsw i64 [[T]], 1
+; CHECK-NEXT:    ret i64 [[A]]
+;
+  %t = sext i16 %s to i32
+  %a = add nsw i32 %t, 1
+  %e = sext i32 %a to i64
+  ret i64 %e
+}
+
+define i64 @or_negative_constant_multiuse_trunc(i64 %x) {
+; CHECK-LABEL: define i64 @or_negative_constant_multiuse_trunc(
+; CHECK-SAME: i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    [[A:%.*]] = or i64 [[X]], -8
+; CHECK-NEXT:    ret i64 [[A]]
+;
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  %a = or i32 %t, -8
+  %e = sext i32 %a to i64
+  ret i64 %e
+}
+
+; The whole rewrite is undone.
+define i64 @select_of_multiuse_trunc(i64 %x, i1 %c) {
+; CHECK-LABEL: define i64 @select_of_multiuse_trunc(
+; CHECK-SAME: i64 [[X:%.*]], i1 [[C:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    [[A:%.*]] = add i64 [[X]], 3
+; CHECK-NEXT:    [[B:%.*]] = mul i64 [[X]], 5
+; CHECK-NEXT:    [[S:%.*]] = select i1 [[C]], i64 [[A]], i64 [[B]]
+; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[S]], 32
+; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    ret i64 [[E]]
+;
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  %a = add nsw i32 %t, 3
+  %b = mul i32 %t, 5
+  %s = select i1 %c, i32 %a, i32 %b
+  %e = sext i32 %s to i64
+  ret i64 %e
+}
+
+define i64 @phi_of_multiuse_trunc(i64 %x, i1 %c) {
+; CHECK-LABEL: define i64 @phi_of_multiuse_trunc(
+; CHECK-SAME: i64 [[X:%.*]], i1 [[C:%.*]]) {
+; CHECK-NEXT:  [[ENTRY:.*:]]
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    br i1 [[C]], label %[[A:.*]], label %[[B:.*]]
+; CHECK:       [[A]]:
+; CHECK-NEXT:    [[Y:%.*]] = add i64 [[X]], 5
+; CHECK-NEXT:    br label %[[M:.*]]
+; CHECK:       [[B]]:
+; CHECK-NEXT:    [[Z:%.*]] = mul i64 [[X]], 3
+; CHECK-NEXT:    br label %[[M]]
+; CHECK:       [[M]]:
+; CHECK-NEXT:    [[P:%.*]] = phi i64 [ [[Y]], %[[A]] ], [ [[Z]], %[[B]] ]
+; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[P]], 32
+; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    ret i64 [[E]]
+;
+entry:
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  br i1 %c, label %a, label %b
+a:
+  %y = add i32 %t, 5
+  br label %m
+b:
+  %z = mul i32 %t, 3
+  br label %m
+m:
+  %p = phi i32 [ %y, %a ], [ %z, %b ]
+  %e = sext i32 %p to i64
+  ret i64 %e
+}
+
+; Without the widening, foldICmpWithTruncSignExtendedVal() folds this.
+define i1 @lossy_trunc_check_multiuse_trunc(i64 %x) {
+; CHECK-LABEL: define i1 @lossy_trunc_check_multiuse_trunc(
+; CHECK-SAME: i64 [[X:%.*]]) {
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    call void @use32(i32 [[T]])
+; CHECK-NEXT:    [[TMP1:%.*]] = add i64 [[X]], -2147483648
+; CHECK-NEXT:    [[C:%.*]] = icmp ult i64 [[TMP1]], -4294967296
+; CHECK-NEXT:    ret i1 [[C]]
+;
+  %t = trunc i64 %x to i32
+  call void @use32(i32 %t)
+  %s = sext i32 %t to i64
+  %c = icmp ne i64 %s, %x
+  ret i1 %c
+}
