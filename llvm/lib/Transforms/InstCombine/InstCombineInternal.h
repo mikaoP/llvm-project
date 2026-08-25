@@ -845,7 +845,10 @@ public:
   Instruction *SimplifyAnyMemTransfer(AnyMemTransferInst *MI);
   Instruction *SimplifyAnyMemSet(AnyMemSetInst *MI);
 
-  Value *EvaluateInDifferentType(Value *V, Type *Ty, bool isSigned);
+  Value *EvaluateInDifferentType(
+      Value *V, Type *Ty, bool isSigned,
+      SmallVectorImpl<std::pair<Instruction *, Instruction *>> *Trace =
+          nullptr);
 
   bool tryToSinkInstruction(Instruction *I, BasicBlock *DestBlock);
   void tryToSinkInstructionDbgVariableRecords(

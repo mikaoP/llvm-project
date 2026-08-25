@@ -24,8 +24,7 @@ define i64 @sext_of_multiuse_trunc(i64 %x) {
 ; CHECK-SAME: i64 [[X:%.*]]) {
 ; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
 ; CHECK-NEXT:    call void @use32(i32 [[T]])
-; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[X]], 32
-; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    [[E:%.*]] = sext i32 [[T]] to i64
 ; CHECK-NEXT:    ret i64 [[E]]
 ;
   %t = trunc i64 %x to i32
@@ -40,10 +39,9 @@ define ptr @sext_of_add_of_multiuse_trunc(ptr %p, i64 %x) {
 ; CHECK-SAME: ptr [[P:%.*]], i64 [[X:%.*]]) {
 ; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
 ; CHECK-NEXT:    call void @use32(i32 [[T]])
-; CHECK-NEXT:    [[A:%.*]] = shl i64 [[X]], 32
-; CHECK-NEXT:    [[SEXT:%.*]] = add i64 [[A]], 4294967296
-; CHECK-NEXT:    [[TMP1:%.*]] = ashr exact i64 [[SEXT]], 30
-; CHECK-NEXT:    [[G:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 [[TMP1]]
+; CHECK-NEXT:    [[TMP1:%.*]] = sext i32 [[T]] to i64
+; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr [4 x i8], ptr [[P]], i64 [[TMP1]]
+; CHECK-NEXT:    [[G:%.*]] = getelementptr i8, ptr [[TMP2]], i64 4
 ; CHECK-NEXT:    ret ptr [[G]]
 ;
   %t = trunc i64 %x to i32
@@ -59,9 +57,8 @@ define i64 @sext_of_add_of_multiuse_trunc_no_nsw(i64 %x) {
 ; CHECK-SAME: i64 [[X:%.*]]) {
 ; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
 ; CHECK-NEXT:    call void @use32(i32 [[T]])
-; CHECK-NEXT:    [[A:%.*]] = shl i64 [[X]], 32
-; CHECK-NEXT:    [[SEXT:%.*]] = add i64 [[A]], 4294967296
-; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    [[A:%.*]] = add i32 [[T]], 1
+; CHECK-NEXT:    [[E:%.*]] = sext i32 [[A]] to i64
 ; CHECK-NEXT:    ret i64 [[E]]
 ;
   %t = trunc i64 %x to i32
@@ -91,14 +88,13 @@ define i64 @sext_of_add_of_multiuse_trunc_variable_offset(i64 %x, i32 %k) {
 define float @two_taps(ptr %p, i64 %x) {
 ; CHECK-LABEL: define float @two_taps(
 ; CHECK-SAME: ptr [[P:%.*]], i64 [[X:%.*]]) {
-; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[X]], 32
-; CHECK-NEXT:    [[TMP1:%.*]] = ashr exact i64 [[SEXT]], 30
-; CHECK-NEXT:    [[G0:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 [[TMP1]]
+; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
+; CHECK-NEXT:    [[E0:%.*]] = sext i32 [[T]] to i64
+; CHECK-NEXT:    [[G0:%.*]] = getelementptr inbounds [4 x i8], ptr [[P]], i64 [[E0]]
 ; CHECK-NEXT:    [[V0:%.*]] = load float, ptr [[G0]], align 4
-; CHECK-NEXT:    [[A:%.*]] = shl i64 [[X]], 32
-; CHECK-NEXT:    [[SEXT1:%.*]] = add i64 [[A]], 4294967296
-; CHECK-NEXT:    [[TMP2:%.*]] = ashr exact i64 [[SEXT1]], 30
-; CHECK-NEXT:    [[G1:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 [[TMP2]]
+; CHECK-NEXT:    [[TMP1:%.*]] = sext i32 [[T]] to i64
+; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr [4 x i8], ptr [[P]], i64 [[TMP1]]
+; CHECK-NEXT:    [[G1:%.*]] = getelementptr i8, ptr [[TMP2]], i64 4
 ; CHECK-NEXT:    [[V1:%.*]] = load float, ptr [[G1]], align 4
 ; CHECK-NEXT:    [[S:%.*]] = fadd float [[V0]], [[V1]]
 ; CHECK-NEXT:    ret float [[S]]
@@ -194,11 +190,10 @@ define i64 @select_of_multiuse_trunc(i64 %x, i1 %c) {
 ; CHECK-SAME: i64 [[X:%.*]], i1 [[C:%.*]]) {
 ; CHECK-NEXT:    [[T:%.*]] = trunc i64 [[X]] to i32
 ; CHECK-NEXT:    call void @use32(i32 [[T]])
-; CHECK-NEXT:    [[A:%.*]] = add i64 [[X]], 3
-; CHECK-NEXT:    [[B:%.*]] = mul i64 [[X]], 5
-; CHECK-NEXT:    [[S:%.*]] = select i1 [[C]], i64 [[A]], i64 [[B]]
-; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[S]], 32
-; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    [[A:%.*]] = add nsw i32 [[T]], 3
+; CHECK-NEXT:    [[B:%.*]] = mul i32 [[T]], 5
+; CHECK-NEXT:    [[S:%.*]] = select i1 [[C]], i32 [[A]], i32 [[B]]
+; CHECK-NEXT:    [[E:%.*]] = sext i32 [[S]] to i64
 ; CHECK-NEXT:    ret i64 [[E]]
 ;
   %t = trunc i64 %x to i32
@@ -218,15 +213,14 @@ define i64 @phi_of_multiuse_trunc(i64 %x, i1 %c) {
 ; CHECK-NEXT:    call void @use32(i32 [[T]])
 ; CHECK-NEXT:    br i1 [[C]], label %[[A:.*]], label %[[B:.*]]
 ; CHECK:       [[A]]:
-; CHECK-NEXT:    [[Y:%.*]] = add i64 [[X]], 5
+; CHECK-NEXT:    [[Y:%.*]] = add i32 [[T]], 5
 ; CHECK-NEXT:    br label %[[M:.*]]
 ; CHECK:       [[B]]:
-; CHECK-NEXT:    [[Z:%.*]] = mul i64 [[X]], 3
+; CHECK-NEXT:    [[Z:%.*]] = mul i32 [[T]], 3
 ; CHECK-NEXT:    br label %[[M]]
 ; CHECK:       [[M]]:
-; CHECK-NEXT:    [[P:%.*]] = phi i64 [ [[Y]], %[[A]] ], [ [[Z]], %[[B]] ]
-; CHECK-NEXT:    [[SEXT:%.*]] = shl i64 [[P]], 32
-; CHECK-NEXT:    [[E:%.*]] = ashr exact i64 [[SEXT]], 32
+; CHECK-NEXT:    [[P:%.*]] = phi i32 [ [[Y]], %[[A]] ], [ [[Z]], %[[B]] ]
+; CHECK-NEXT:    [[E:%.*]] = sext i32 [[P]] to i64
 ; CHECK-NEXT:    ret i64 [[E]]
 ;
 entry:

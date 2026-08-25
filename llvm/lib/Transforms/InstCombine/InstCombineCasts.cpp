@@ -33,15 +33,20 @@ using namespace PatternMatch;
 
 #define DEBUG_TYPE "instcombine"
 
-using EvaluatedMap = SmallDenseMap<Value *, Value *, 8>;
+namespace {
+struct EvaluationState {
+  SmallDenseMap<Value *, Value *, 8> Processed;
+  SmallVectorImpl<std::pair<Instruction *, Instruction *>> *Trace = nullptr;
+};
+} // anonymous namespace
 
 static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
                                           InstCombinerImpl &IC,
-                                          EvaluatedMap &Processed) {
+                                          EvaluationState &State) {
   // Since we cover transformation of instructions with multiple users, we might
   // come to the same node via multiple paths. We should not create a
   // replacement for every single one of them though.
-  if (Value *Result = Processed.lookup(V))
+  if (Value *Result = State.Processed.lookup(V))
     return Result;
 
   if (Constant *C = dyn_cast<Constant>(V))
@@ -63,10 +68,10 @@ static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
   case Instruction::Shl:
   case Instruction::UDiv:
   case Instruction::URem: {
-    Value *LHS = EvaluateInDifferentTypeImpl(I->getOperand(0), Ty, isSigned, IC,
-                                             Processed);
-    Value *RHS = EvaluateInDifferentTypeImpl(I->getOperand(1), Ty, isSigned, IC,
-                                             Processed);
+    Value *LHS =
+        EvaluateInDifferentTypeImpl(I->getOperand(0), Ty, isSigned, IC, State);
+    Value *RHS =
+        EvaluateInDifferentTypeImpl(I->getOperand(1), Ty, isSigned, IC, State);
     Res = BinaryOperator::Create((Instruction::BinaryOps)Opc, LHS, RHS);
     if (Opc == Instruction::LShr || Opc == Instruction::AShr)
       Res->setIsExact(I->isExact());
@@ -99,10 +104,10 @@ static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
     }
     break;
   case Instruction::Select: {
-    Value *True = EvaluateInDifferentTypeImpl(I->getOperand(1), Ty, isSigned,
-                                              IC, Processed);
-    Value *False = EvaluateInDifferentTypeImpl(I->getOperand(2), Ty, isSigned,
-                                               IC, Processed);
+    Value *True =
+        EvaluateInDifferentTypeImpl(I->getOperand(1), Ty, isSigned, IC, State);
+    Value *False =
+        EvaluateInDifferentTypeImpl(I->getOperand(2), Ty, isSigned, IC, State);
     Res = SelectInst::Create(I->getOperand(0), True, False);
     break;
   }
@@ -111,7 +116,7 @@ static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
     PHINode *NPN = PHINode::Create(Ty, OPN->getNumIncomingValues());
     for (unsigned i = 0, e = OPN->getNumIncomingValues(); i != e; ++i) {
       Value *V = EvaluateInDifferentTypeImpl(OPN->getIncomingValue(i), Ty,
-                                             isSigned, IC, Processed);
+                                             isSigned, IC, State);
       NPN->addIncoming(V, OPN->getIncomingBlock(i));
     }
     Res = NPN;
@@ -138,9 +143,9 @@ static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
       case Intrinsic::smin:
       case Intrinsic::smax: {
         Value *Op0 = EvaluateInDifferentTypeImpl(II->getArgOperand(0), Ty,
-                                                 isSigned, IC, Processed);
+                                                 isSigned, IC, State);
         Value *Op1 = EvaluateInDifferentTypeImpl(II->getArgOperand(1), Ty,
-                                                 isSigned, IC, Processed);
+                                                 isSigned, IC, State);
         Function *Fn = Intrinsic::getOrInsertDeclaration(
             I->getModule(), II->getIntrinsicID(), {Ty});
         Res = CallInst::Create(Fn->getFunctionType(), Fn, {Op0, Op1});
@@ -148,7 +153,7 @@ static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
       }
       case Intrinsic::abs: {
         Value *Arg = EvaluateInDifferentTypeImpl(II->getArgOperand(0), Ty,
-                                                 isSigned, IC, Processed);
+                                                 isSigned, IC, State);
         Function *Fn = Intrinsic::getOrInsertDeclaration(
             I->getModule(), II->getIntrinsicID(), {Ty});
         Res = CallInst::Create(Fn->getFunctionType(), Fn,
@@ -163,9 +168,9 @@ static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
     auto *VTy = cast<VectorType>(I->getOperand(0)->getType());
     auto *FixedTy = VectorType::get(ScalarTy, VTy->getElementCount());
     Value *Op0 = EvaluateInDifferentTypeImpl(I->getOperand(0), FixedTy,
-                                             isSigned, IC, Processed);
+                                             isSigned, IC, State);
     Value *Op1 = EvaluateInDifferentTypeImpl(I->getOperand(1), FixedTy,
-                                             isSigned, IC, Processed);
+                                             isSigned, IC, State);
     Res = new ShuffleVectorInst(Op0, Op1,
                                 cast<ShuffleVectorInst>(I)->getShuffleMask());
     break;
@@ -177,21 +182,26 @@ static Value *EvaluateInDifferentTypeImpl(Value *V, Type *Ty, bool isSigned,
 
   Res->takeName(I);
   Value *Result = IC.InsertNewInstWith(Res, I->getIterator());
+  if (State.Trace)
+    State.Trace->emplace_back(Res, I);
   // There is no need in keeping track of the old value/new value relationship
   // when we have only one user, we came have here from that user and no-one
   // else cares.
   if (!V->hasOneUse())
-    Processed[V] = Result;
+    State.Processed[V] = Result;
 
   return Result;
 }
 
 /// Given an expression that CanEvaluateTruncated or CanEvaluateSExtd returns
-/// true for, actually insert the code to evaluate the expression.
-Value *InstCombinerImpl::EvaluateInDifferentType(Value *V, Type *Ty,
-                                                 bool isSigned) {
-  EvaluatedMap Processed;
-  return EvaluateInDifferentTypeImpl(V, Ty, isSigned, *this, Processed);
+/// true for, actually insert the code to evaluate the expression. If \p Trace
+/// is non-null, it receives each (new, old) instruction pair in creation order.
+Value *InstCombinerImpl::EvaluateInDifferentType(
+    Value *V, Type *Ty, bool isSigned,
+    SmallVectorImpl<std::pair<Instruction *, Instruction *>> *Trace) {
+  EvaluationState State;
+  State.Trace = Trace;
+  return EvaluateInDifferentTypeImpl(V, Ty, isSigned, *this, State);
 }
 
 Instruction::CastOps
@@ -318,8 +328,11 @@ public:
 
   /// Return true if we can take the specified value and return it as type Ty
   /// without inserting any new casts and without changing the value of the
-  /// common low bits.
-  [[nodiscard]] static bool canEvaluateSExtd(Value *V, Type *Ty);
+  /// common low bits. If \p NumRemovedCasts is non-null, it receives the number
+  /// of casts that rewriting the sext \p CtxI would remove.
+  [[nodiscard]] static bool
+  canEvaluateSExtd(Value *V, Type *Ty, const Instruction *CtxI = nullptr,
+                   unsigned *NumRemovedCasts = nullptr);
 
 private:
   /// Constants and extensions/truncates from the destination type are always
@@ -337,8 +350,13 @@ private:
   [[nodiscard]] bool
   canEvaluate(Value *V, Type *Ty,
               llvm::function_ref<bool(Value *, Type *Type)> Pred) {
-    if (canAlwaysEvaluateInType(V, Ty))
+    if (canAlwaysEvaluateInType(V, Ty)) {
+      // Casts from Ty are replaced by their operand, so they are the only
+      // instructions the rewrite can remove.
+      if (auto *Cast = dyn_cast<CastInst>(V))
+        FreeCasts.insert(Cast);
       return true;
+    }
 
     auto *I = dyn_cast<Instruction>(V);
 
@@ -467,6 +485,12 @@ private:
 
   /// A list of pending values to check in the end.
   SmallVector<Value *, 8> Pending;
+
+  /// Casts from the destination type seen during the traversal.
+  SmallPtrSet<CastInst *, 8> FreeCasts;
+
+  /// Return how many of FreeCasts the rewrite removes.
+  [[nodiscard]] unsigned countRemovedCasts(const Instruction *CtxI);
 };
 
 } // anonymous namespace
@@ -1859,6 +1883,16 @@ Instruction *InstCombinerImpl::transformSExtICmp(ICmpInst *Cmp,
   return nullptr;
 }
 
+/// The rewrite replaces every instruction it visits by a new one, so the only
+/// instructions it removes are casts from the destination type whose users are
+/// all replaced as well.
+unsigned TypeEvaluationHelper::countRemovedCasts(const Instruction *CtxI) {
+  return count_if(FreeCasts, [&](CastInst *Cast) {
+    return all_of(Cast->users(),
+                  [&](User *U) { return U == CtxI || Visited.contains(U); });
+  });
+}
+
 /// Return true if we can take the specified value and return it as type Ty
 /// without inserting any new casts and without changing the value of the common
 /// low bits.  This is used by code that tries to promote integer operations to
@@ -1866,9 +1900,15 @@ Instruction *InstCombinerImpl::transformSExtICmp(ICmpInst *Cmp,
 ///
 /// This function works on both vectors and scalars.
 ///
-bool TypeEvaluationHelper::canEvaluateSExtd(Value *V, Type *Ty) {
+bool TypeEvaluationHelper::canEvaluateSExtd(Value *V, Type *Ty,
+                                            const Instruction *CtxI,
+                                            unsigned *NumRemovedCasts) {
   TypeEvaluationHelper TYH;
-  return TYH.canEvaluateSExtdImpl(V, Ty) && TYH.allPendingVisited();
+  if (!TYH.canEvaluateSExtdImpl(V, Ty) || !TYH.allPendingVisited())
+    return false;
+  if (NumRemovedCasts)
+    *NumRemovedCasts = TYH.countRemovedCasts(CtxI);
+  return true;
 }
 
 bool TypeEvaluationHelper::canEvaluateSExtdImpl(Value *V, Type *Ty) {
@@ -1951,14 +1991,23 @@ Instruction *InstCombinerImpl::visitSExt(SExtInst &Sext) {
   if (match(Src, m_Trunc(m_Value(TruncSrc))))
     if (TruncSrc->getType()->getScalarSizeInBits() > DestBitSize)
       ShouldExtendExpression = false;
+  unsigned NumRemovedCasts = 0;
   if (ShouldExtendExpression && shouldChangeType(SrcTy, DestTy) &&
-      TypeEvaluationHelper::canEvaluateSExtd(Src, DestTy)) {
+      TypeEvaluationHelper::canEvaluateSExtd(Src, DestTy, &Sext,
+                                             &NumRemovedCasts)) {
+    // Emitting shl + ashr is only profitable if the rewrite removes a cast.
+    // Otherwise, trace the rewrite so that it can be undone.
+    bool MustRemoveSext = NumRemovedCasts == 0;
+    SmallVector<std::pair<Instruction *, Instruction *>, 8> Trace;
+    bool SavedMadeIRChange = MadeIRChange;
+
     // Okay, we can transform this!  Insert the new expression now.
     LLVM_DEBUG(
         dbgs() << "ICE: EvaluateInDifferentType converting expression type"
                   " to avoid sign extend: "
                << Sext << '\n');
-    Value *Res = EvaluateInDifferentType(Src, DestTy, true);
+    Value *Res = EvaluateInDifferentType(Src, DestTy, true,
+                                         MustRemoveSext ? &Trace : nullptr);
     assert(Res->getType() == DestTy);
 
     // If the high bits are already filled with sign bit, just replace this
@@ -1966,10 +2015,21 @@ Instruction *InstCombinerImpl::visitSExt(SExtInst &Sext) {
     if (ComputeNumSignBits(Res, &Sext) > DestBitSize - SrcBitSize)
       return replaceInstUsesWith(Sext, Res);
 
-    // We need to emit a shl + ashr to do the sign extend.
-    Value *ShAmt = ConstantInt::get(DestTy, DestBitSize - SrcBitSize);
-    return BinaryOperator::CreateAShr(Builder.CreateShl(Res, ShAmt, "sext"),
-                                      ShAmt);
+    if (!MustRemoveSext) {
+      // We need to emit a shl + ashr to do the sign extend.
+      Value *ShAmt = ConstantInt::get(DestTy, DestBitSize - SrcBitSize);
+      return BinaryOperator::CreateAShr(Builder.CreateShl(Res, ShAmt, "sext"),
+                                        ShAmt);
+    }
+
+    // Undo the rewrite, erasing in reverse order so that each new instruction
+    // is dead when erased. The undo must not count as a change, or InstCombine
+    // would not reach a fixpoint.
+    for (auto &[New, Old] : reverse(Trace)) {
+      Old->takeName(New);
+      eraseInstFromFunction(*New);
+    }
+    MadeIRChange = SavedMadeIRChange;
   }
 
   Value *X = TruncSrc;
